@@ -4,6 +4,18 @@ class Pdo {
         this.escape = options.escapeCb ?? encodeURI;
         this.unescape = options.unescapeCb ?? unescape;
         this.clean();
+        this._catch = console.error;
+        this._getLogDuration = options.getLogDuration;
+    }
+
+    catch(fn) {
+        this._catch = fn;
+        return this;
+    }
+
+    setEscape(escape) {
+        this.escape = escape ?? encodeURI;
+        return this;
     }
 
     clean() {
@@ -14,12 +26,15 @@ class Pdo {
         this._values = null;
         this._groupBy = null;
         this._select = null;
-        this._join = null;
+        this._join = [];
         this._orderBy = null;
         this._orderDirection = null;
         this._limit = null;
         this._offset = null;
         this._returning = null;
+        this._conflict = null;
+        this._having = null;
+        this._subQueries = [];
     }
 
     select(select = ['*']) {
@@ -101,13 +116,13 @@ class Pdo {
         return this;
     }
 
-    leftJoin(joinTable, field1, cond, field2) {
-        this._join = `LEFT JOIN ${joinTable} ON ${field1} ${cond} ${field2}`;
+    leftJoin(joinTable, field1, cond, field2, clause, condWhere, value) {
+        this._join.push(`LEFT JOIN ${joinTable} ON ${field1} ${cond} ${field2}${clause ? ` AND ${clause} ${condWhere} ${this.escapeData(value)}` : ''}`);
         return this;
     }
 
-    where(clause, cond, value) {
-        this._where = `${clause} ${cond} ${this.escapeData(value)}`;
+    where(clause, cond, value, skipEscape = false) {
+        this._where = `${clause} ${cond} ${skipEscape ? value : this.escapeData(value)}`;
         return this;
     }
 
@@ -116,13 +131,28 @@ class Pdo {
         return this;
     }
 
+    whereIsNotNull(clause) {
+        this._where = `${clause} IS NOT NULL`;
+        return this;
+    }
+
     orWhereIsNull(clause) {
         this._where = `${this._where} OR ${clause} IS NULL`;
         return this;
     }
 
+    orWhereIsNotNull(clause) {
+        this._where = `${this._where} OR ${clause} IS NOT NULL`;
+        return this;
+    }
+
     andWhereIsNull(clause) {
         this._where = `${this._where} AND ${clause} IS NULL`;
+        return this;
+    }
+
+    andWhereIsNotNull(clause) {
+        this._where = `${this._where} AND ${clause} IS NOT NULL`;
         return this;
     }
 
@@ -142,7 +172,38 @@ class Pdo {
     }
 
     andWhereIn(clause, arr) {
-        this._where = `${this._where} AND ${clause} IN (${arr.map(this.escapeData).join(',')})`;
+        this._where = `${this._where} AND ${clause} IN (${arr.map(item => this.escapeData(item)).join(',')})`;
+        return this;
+    }
+
+    andWhereNotIn(clause, arr) {
+        this._where = `${this._where} AND ${clause} NOT IN (${arr.map(item => this.escapeData(item)).join(',')})`;
+        return this;
+    }
+
+    andWithBrace() {
+        this._where = `${this._where} AND (1 = 1`;
+        return this;
+    }
+
+    orWithBrace() {
+        this._where = `${this._where} OR (1 = 1`;
+        return this;
+    }
+
+    closeBrace() {
+        this._where = `${this._where})`;
+        return this;
+    }
+
+    conflictDoNothing() {
+        this._conflict = `DO NOTHING`;
+        return this;
+    }
+
+    conflictDoUpdate(clause, pairs) {
+        this._conflict = `(${clause}) DO UPDATE SET ${Object.keys(pairs).map(column =>
+            (`${column} = ${this.escapeData(pairs[column])}`)).join(',')}`;
         return this;
     }
 
@@ -157,15 +218,40 @@ class Pdo {
         return this;
     }
 
+    having(clause, cond, value, skipEscape = false) {
+        this._having = `${clause} ${cond} ${skipEscape ? value : this.escapeData(value)}`;
+        return this;
+    }
+
+    andHaving(clause, cond, value) {
+        this._having = `${this._having} AND ${clause} ${cond} ${this.escapeData(value)}`;
+        return this;
+    }
+
+    orHaving(clause, cond, value) {
+        this._having = `${this._having} OR ${clause} ${cond} ${this.escapeData(value)}`;
+        return this;
+    }
+
     limit(limit, offset = 0) {
         this._limit = limit;
         this._offset = offset;
         return this;
     }
 
+    with(subQueries) {
+        if (Array.isArray(subQueries))
+            this._subQueries = [...subQueries];
+
+        if (typeof subQueries === 'string')
+            this._subQueries = [subQueries];
+
+        return this;
+    }
+
     escapeData(value) {
         try {
-            if (value === null) {
+            if (value === null || !this.escape) {
                 return value;
             } else if (typeof value === "boolean") {
                 return value;
@@ -191,14 +277,19 @@ class Pdo {
             case 'select':
                 query = `SELECT ${this.join(this._select)}
                          FROM ${this._table}`;
-                if (this._join) {
-                    query += ` ${this._join}`;
+                if (this._join.length) {
+                    this._join.map(str => {
+                        query += ` ${str}`;
+                    });
                 }
                 if (this._where) {
                     query += ` WHERE ${this._where}`;
                 }
                 if (this._groupBy) {
                     query += ` GROUP BY ${this._groupBy}`;
+                }
+                if (this._having) {
+                    query += ` HAVING ${this._having}`;
                 }
                 if (this._orderBy) {
                     query += ` ORDER BY ${this._orderBy} ${this._orderDirection}`;
@@ -209,13 +300,22 @@ class Pdo {
                 if (this._offset) {
                     query += ` OFFSET ${this._offset}`;
                 }
+                if (this._subQueries.length) {
+                    query = `WITH ${this._subQueries.join(',')} ${query}`;
+                }
                 break;
             case 'insert':
                 query =
                     `INSERT INTO ${this._table} (${this._columns?.join(',')})
                      VALUES (${this.join(this._values?.map((v) => this.escapeData(v)))})`;
+                if (this._conflict) {
+                    query += ` ON CONFLICT ${this._conflict}`;
+                }
                 if (this._returning) {
                     query += ` RETURNING ${this._returning}`;
+                }
+                if (this._subQueries.length) {
+                    query = `WITH ${this._subQueries.join(',')} ${query}`;
                 }
                 break;
             case 'update':
@@ -223,11 +323,17 @@ class Pdo {
                          SET ${this._values?.map((value, i) => {
                              return `${this._columns[i]} = ${this.escapeData(value)}`;
                          }).join(',')}`;
+                if (this._conflict) {
+                    query += ` ON CONFLICT ${this._conflict}`;
+                }
                 if (this._where) {
                     query += ` WHERE ${this._where}`;
                 }
                 if (this._returning) {
                     query += ` RETURNING ${this._returning}`;
+                }
+                if (this._subQueries.length) {
+                    query = `WITH ${this._subQueries.join(',')} ${query}`;
                 }
                 break;
             case 'delete':
@@ -236,20 +342,28 @@ class Pdo {
                 if (this._where) {
                     query += ` WHERE ${this._where}`;
                 }
+                if (this._returning) {
+                    query += ` RETURNING ${this._returning}`;
+                }
+                if (this._subQueries.length) {
+                    query = `WITH ${this._subQueries.join(',')} ${query}`;
+                }
                 break;
         }
         return query;
     }
 
-    execute() {
+    async execute() {
+        const startTime = new Date().getTime();
         const query = this.getQuery();
         try {
-            return this.client.unsafe(query);
-        } catch (e) {
-            throw {
-                error: e,
-                query,
+            const result = await this.client.unsafe(query);
+            if (this._getLogDuration) {
+                this._getLogDuration(query.replace(/\n/g, ' ').replace(/\s+/g, ' '), new Date().getTime() - startTime);
             }
+            return result;
+        } catch (e) {
+            this._catch(e);
         }
     }
 }
